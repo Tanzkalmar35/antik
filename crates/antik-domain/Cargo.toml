@@ -1,0 +1,15 @@
+[package]
+name = "antik-domain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Pure domain types and policies for antik; no IO, no async."
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+time.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

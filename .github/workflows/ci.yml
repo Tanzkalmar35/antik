@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        # rustfmt and clippy are components, not crates; the runner's default
+        # toolchain does not always ship them.
+        run: rustup component add rustfmt clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: System libraries for Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: bun run build

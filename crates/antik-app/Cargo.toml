@@ -1,0 +1,14 @@
+[package]
+name = "antik-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Use cases and ports for antik."
+
+[dependencies]
+antik-domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+specta.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
