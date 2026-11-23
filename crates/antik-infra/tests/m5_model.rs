@@ -57,6 +57,7 @@ impl ProjectFiles for Scope {
         Ok(ScannedProject {
             brief: None,
             notes: Vec::new(),
+            tasks: Vec::new(),
         })
     }
 

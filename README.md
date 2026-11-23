@@ -12,4 +12,6 @@ This template should help get you started developing with Tauri in vanilla HTML,
 bun run tauri build --no-bundle
 sudo install -Dm755 target/release/antik /usr/local/bin/antik
 install -Dm644 src-tauri/icons/128x128.png ~/.local/share/icons/hicolor/128x128/apps/antik.png
+install -Dm644 antik.desktop ~/.local/share/applications/antik.desktop
+update-desktop-database ~/.local/share/applications
 ```

@@ -521,10 +521,10 @@ Ownership matrix:
 | `notes/*.md` body + title | yes | yes | **imported** |
 | `decisions/*.md` | yes | append | **imported** (new files) |
 | `questions/*.md` | yes | yes | **imported** |
-| `tasks/*.md` | yes | yes | ignored, replaced on next projection |
+| `tasks/*.md` | yes | yes | **imported** when the id is new; existing tasks replaced |
 | `glossary.md` | yes | yes | ignored, replaced |
 
-The import lane is deliberate: those four document kinds are what "open it in Obsidian" means. Before any write to one of them, `import_changed` compares `file_index.content_hash` with the file on disk; a mismatch is parsed and applied as a domain edit event (`brief_edited`, `note_added`, …) with `actor = user`, timestamped at import, then re-projected. Parsing is strict: unknown `kind`, unknown schema version or a missing id is reported as `invalid_document` with the path, never guessed at.
+The import lane is deliberate: those document kinds are what "open it in Obsidian" means. A task document is imported only when its id is not in the store yet: its scope, description and plan tree (sections, subtasks, definition of done, with `[x]` carrying status) become a task in the plan phase, and the app's projection of phase, lane, discussion, working notes, attempts and gates takes over from there — so editing an existing task document is still not picked up. Before any write to one of them, `import_changed` compares `file_index.content_hash` with the file on disk; a mismatch is parsed and applied as a domain edit event (`brief_edited`, `note_added`, …) with `actor = user`, timestamped at import, then re-projected. Parsing is strict: unknown `kind`, unknown schema version or a missing id is reported as `invalid_document` with the path, never guessed at.
 
 Conflict policy: a write command that replaces text takes an optional `expected_revision`. If an external import landed since the UI read the record, the command fails with `conflict` and the UI reloads. Appends (notes, decisions, questions, attempts) never conflict.
 
@@ -705,7 +705,7 @@ Explicitly deferred: the hosted API lane and its keyring, delegate lane, git che
 
 ## 13. Risks and open decisions
 
-1. **Markdown ownership.** This plan makes SQLite authoritative and markdown a projection, with a four-document import lane. That is the simplest correct model, but it means task documents are read-only outside the app. If editing tasks in Obsidian matters, the import lane has to grow a strict section parser and a conflict UI. Decide before M1 ships, not after.
+1. **Markdown ownership.** This plan makes SQLite authoritative and markdown a projection, with a four-document import lane. That is the simplest correct model, but it means a task document that already exists is read-only outside the app. If editing tasks in Obsidian matters, the import lane has to grow a strict section parser and a conflict UI. Decide before M1 ships, not after.
 2. **Deterministic gate scoring quality.** Keyword rubrics are honest but shallow. The interface (`GateScorer`) allows a second scorer later, but v1 will feel mechanical on answers that are correct but phrased differently. Watch it in the first month; overrides are the escape hatch.
 3. **Check authoring UX.** The runner is only useful if writing a definition of done is quick. That is a frontend milestone, not backend.
 4. **Cross-platform process control.** Process-group kill is Unix-shaped; Windows needs a job object. If Windows is not a target, say so and drop the claim rather than ship a half version.

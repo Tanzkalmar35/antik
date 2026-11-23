@@ -254,17 +254,52 @@ pub struct ScopedFile {
     pub truncated: bool,
 }
 
-/// A document read from the project folder. Only the four editable kinds are
-/// imported; task documents and the glossary are projections.
+/// A document read from the project folder. The glossary and the task history
+/// sections are projections and are not read back.
 pub struct ScannedProject {
-    pub brief: Option<String>,
+    pub brief: Option<ScannedBrief>,
     pub notes: Vec<ScannedNote>,
+    pub tasks: Vec<ScannedTask>,
+}
+
+/// A brief with the project its frontmatter names. A folder that arrived from
+/// another installation still carries that installation's project id, so the
+/// caller decides ownership rather than the parser.
+pub struct ScannedBrief {
+    pub project: String,
+    pub text: String,
 }
 
 pub struct ScannedNote {
     pub id: String,
+    pub project: String,
     pub title: String,
     pub text: String,
+}
+
+/// A task document that is not in the store yet. Only the structure a person
+/// edits is read: the scope, the description and the plan tree. Phase, lane,
+/// discussion, working notes, attempts and gates belong to the app.
+pub struct ScannedTask {
+    pub id: String,
+    pub project: String,
+    pub title: String,
+    pub scope: String,
+    pub description: String,
+    pub sections: Vec<ScannedTaskSection>,
+    pub dods: Vec<ScannedPlanItem>,
+}
+
+pub struct ScannedTaskSection {
+    pub title: String,
+    pub body: String,
+    pub subtasks: Vec<ScannedPlanItem>,
+}
+
+pub struct ScannedPlanItem {
+    pub title: String,
+    pub body: String,
+    pub done: bool,
 }
 
 /// Markdown projection and import lane. A failed projection is logged but
@@ -314,6 +349,7 @@ impl ProjectFiles for NoFiles {
         Ok(ScannedProject {
             brief: None,
             notes: Vec::new(),
+            tasks: Vec::new(),
         })
     }
 

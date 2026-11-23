@@ -2,7 +2,10 @@
 //!
 //! SQLite is authoritative. Each committed mutation rewrites the project's
 //! documents atomically so the folder is always readable and commit-ready.
-//! Brief and note documents are read back on open; task documents are not.
+//! Brief, note and task documents are read back on open and at launch: a task
+//! document that is not in the store yet becomes a task, plan tree included.
+//! A folder identifies the project, so documents written by another
+//! installation are handed over and claimed by the caller.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -10,7 +13,10 @@ use std::path::{Path, PathBuf};
 
 use antik_app::dto::{PlanItemKind, PlanItemStatus, ProjectDetail, TaskDetail};
 use antik_app::error::AppError;
-use antik_app::ports::{ProjectFiles, ScannedNote, ScannedProject, ScopedFile};
+use antik_app::ports::{
+    ProjectFiles, ScannedBrief, ScannedNote, ScannedPlanItem, ScannedProject, ScannedTask,
+    ScannedTaskSection, ScopedFile,
+};
 use antik_domain::model::{FILE_MAX_BYTES, MAX_FILES, PROMPT_MAX_CHARS};
 use antik_domain::scope::Pattern;
 
@@ -132,11 +138,17 @@ impl MarkdownFiles {
             return Ok(ScannedProject {
                 brief: None,
                 notes: Vec::new(),
+                tasks: Vec::new(),
             });
         }
 
         let brief = match read_doc(&dir.join("brief.md")) {
-            Ok(Some(doc)) if doc.kind == "brief" && doc.project == project.id => Some(doc.body),
+            Ok(Some(doc)) if doc.kind == "brief" && safe_segment(&doc.project) => {
+                Some(ScannedBrief {
+                    project: doc.project,
+                    text: doc.body,
+                })
+            }
             _ => None,
         };
 
@@ -151,18 +163,46 @@ impl MarkdownFiles {
                 let Ok(Some(doc)) = read_doc(&path) else {
                     continue;
                 };
-                if doc.kind != "note" || doc.project != project.id || !safe_segment(&doc.id) {
+                if doc.kind != "note" || !safe_segment(&doc.id) || !safe_segment(&doc.project) {
                     continue;
                 }
                 notes.push(ScannedNote {
                     id: doc.id,
+                    project: doc.project,
                     title: doc.title,
                     text: doc.body,
                 });
             }
         }
 
-        Ok(ScannedProject { brief, notes })
+        let mut tasks = Vec::new();
+        let tasks_dir = dir.join("tasks");
+        if let Ok(entries) = fs::read_dir(&tasks_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                    continue;
+                }
+                let Ok(Some(doc)) = read_doc(&path) else {
+                    continue;
+                };
+                if doc.kind != "task" || !safe_segment(&doc.id) || !safe_segment(&doc.project) {
+                    continue;
+                }
+                tasks.push(parse_task_document(
+                    &doc.id,
+                    &doc.project,
+                    &doc.title,
+                    &doc.body,
+                ));
+            }
+        }
+
+        Ok(ScannedProject {
+            brief,
+            notes,
+            tasks,
+        })
     }
 }
 
@@ -457,6 +497,193 @@ fn task_document(project: &str, task: &TaskDetail) -> String {
     document("task", &task.id, project, &task.started, &task.title, &body)
 }
 
+/// A task document as the projection writes it. Only the parts a person edits
+/// are read back; the rest is history the app owns and rewrites.
+fn parse_task_document(id: &str, project: &str, title: &str, body: &str) -> ScannedTask {
+    let mut task = ScannedTask {
+        id: id.to_owned(),
+        project: project.to_owned(),
+        title: title.trim().to_owned(),
+        scope: String::new(),
+        description: String::new(),
+        sections: Vec::new(),
+        dods: Vec::new(),
+    };
+
+    // Split on `##` headings. The chunk before the first heading carries the
+    // `# title` line and the three bullets the projection writes.
+    let mut chunks: Vec<(String, Vec<&str>)> = vec![(String::new(), Vec::new())];
+    for line in body.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            chunks.push((heading.trim().to_owned(), Vec::new()));
+        } else if let Some((_, lines)) = chunks.last_mut() {
+            lines.push(line);
+        }
+    }
+
+    for line in &chunks[0].1 {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("# ") {
+            if task.title.is_empty() {
+                task.title = rest.trim().to_owned();
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("- scope:") {
+            task.scope = rest.trim().to_owned();
+        }
+    }
+
+    for (heading, lines) in &chunks {
+        match heading.as_str() {
+            "Description" => task.description = paragraph(lines),
+            "Plan" => task.sections = parse_plan(lines),
+            "Definition of done" => task.dods = parse_plan_items(lines),
+            _ => {}
+        }
+    }
+    task
+}
+
+fn paragraph(lines: &[&str]) -> String {
+    let mut text = String::new();
+    for line in lines {
+        push_line(&mut text, line);
+    }
+    text.trim().to_owned()
+}
+
+fn parse_plan(lines: &[&str]) -> Vec<ScannedTaskSection> {
+    let mut sections: Vec<ScannedTaskSection> = Vec::new();
+    let mut current: Option<ScannedTaskSection> = None;
+    let mut in_items = false;
+
+    for raw in lines {
+        if let Some(rest) = raw.strip_prefix("### ") {
+            if let Some(section) = current.take() {
+                sections.push(finish_section(section));
+            }
+            current = Some(ScannedTaskSection {
+                title: section_title(rest),
+                body: String::new(),
+                subtasks: Vec::new(),
+            });
+            in_items = false;
+            continue;
+        }
+
+        let Some(section) = current.as_mut() else {
+            continue;
+        };
+        let trimmed = raw.trim_end();
+        if let Some(item) = plan_item(trimmed) {
+            section.subtasks.push(item);
+            in_items = true;
+            continue;
+        }
+        if in_items {
+            // The writer indents a subtask's detail by two spaces.
+            if trimmed.starts_with("  ") {
+                if let Some(last) = section.subtasks.last_mut() {
+                    push_line(&mut last.body, trimmed.trim_start());
+                }
+            }
+        } else {
+            push_line(&mut section.body, trimmed);
+        }
+    }
+    if let Some(section) = current.take() {
+        sections.push(finish_section(section));
+    }
+    sections
+}
+
+fn finish_section(mut section: ScannedTaskSection) -> ScannedTaskSection {
+    section.body = section.body.trim().to_owned();
+    for item in &mut section.subtasks {
+        item.title = item.title.trim().to_owned();
+        item.body = item.body.trim().to_owned();
+    }
+    section
+}
+
+/// `### 1. Measurement` carries a number that is only position, so the number
+/// is dropped and the title is what stays.
+fn section_title(raw: &str) -> String {
+    let raw = raw.trim();
+    match raw.split_once(". ") {
+        Some((number, rest))
+            if !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            rest.trim().to_owned()
+        }
+        _ => raw.to_owned(),
+    }
+}
+
+fn plan_item(line: &str) -> Option<ScannedPlanItem> {
+    let rest = line.strip_prefix("- [")?;
+    let (mark, rest) = rest.split_once(']')?;
+    let title = rest.trim();
+    if title.is_empty() {
+        return None;
+    }
+    Some(ScannedPlanItem {
+        title: title.to_owned(),
+        body: String::new(),
+        done: mark.trim().eq_ignore_ascii_case("x"),
+    })
+}
+
+fn parse_plan_items(lines: &[&str]) -> Vec<ScannedPlanItem> {
+    let mut items: Vec<ScannedPlanItem> = Vec::new();
+    for raw in lines {
+        let trimmed = raw.trim_end();
+        if let Some(mut item) = plan_item(trimmed) {
+            item.title = strip_backing(&item.title).to_owned();
+            items.push(item);
+            continue;
+        }
+        if trimmed.starts_with("  ") {
+            if let Some(last) = items.last_mut() {
+                push_line(&mut last.body, trimmed.trim_start());
+            }
+        }
+    }
+    for item in &mut items {
+        item.body = item.body.trim().to_owned();
+    }
+    items
+}
+
+/// The projection writes `— check: <label>` or `— manual` after a definition of
+/// done. The label is not an id, so it is dropped rather than guessed at.
+fn strip_backing(title: &str) -> &str {
+    match title.rsplit_once(" \u{2014} ") {
+        Some((head, tail)) if tail.starts_with("check:") || tail.trim() == "manual" => {
+            head.trim_end()
+        }
+        _ => title,
+    }
+}
+
+fn push_line(target: &mut String, line: &str) {
+    let line = line.trim_end();
+    let bare = line.trim();
+    if matches!(
+        bare,
+        "_Not written yet._" | "_No sections yet._" | "_No subtasks yet._" | "_No criteria yet._"
+    ) {
+        return;
+    }
+    if bare.is_empty() && target.trim().is_empty() {
+        return;
+    }
+    if !target.is_empty() {
+        target.push('\n');
+    }
+    target.push_str(line);
+}
+
 fn one_line(value: &str) -> String {
     value.replace(['\r', '\n'], " ").trim().to_owned()
 }
@@ -671,7 +898,9 @@ mod tests {
         .unwrap();
 
         let scanned = files.scan(&project).unwrap();
-        assert_eq!(scanned.brief.as_deref(), Some("A different brief."));
+        let brief = scanned.brief.expect("a brief is read back");
+        assert_eq!(brief.text, "A different brief.");
+        assert_eq!(brief.project, project.id);
     }
 
     #[test]
@@ -703,6 +932,46 @@ mod tests {
         assert_eq!(scanned.notes.len(), 1);
         assert_eq!(scanned.notes[0].title, "Timing");
         assert_eq!(scanned.notes[0].text, "A note body.");
+        assert_eq!(scanned.notes[0].project, project.id);
+    }
+
+    #[test]
+    fn reads_back_a_task_document_with_its_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = MarkdownFiles::new(dir.path());
+        let project = empty_project(&project_id());
+        files.write_project(&project).unwrap();
+
+        let task_id = project_id();
+        let path = dir
+            .path()
+            .join(&project.id)
+            .join("tasks")
+            .join(format!("{task_id}.md"));
+        fs::write(
+            &path,
+            format!(
+                "---\nantik: 1\nid: {task_id}\nkind: task\nproject: {}\ncreated: 2026-11-21T10:00:00Z\ntitle: Drain the queue\n---\n\n# Drain the queue\n\n- phase: review\n- lane: build\n- scope: src/queue/**\n\n## Description\n\nOne worker is enough.\n\n## Plan\n\n### 1. Measurement\n\nFind the slow path.\n\n- [x] Time one flush\n  Use the dev database.\n\n## Definition of done\n\n- [x] The queue drains under a second. \u{2014} check: queue-flush\n",
+                project.id
+            ),
+        )
+        .unwrap();
+
+        let scanned = files.scan(&project).unwrap();
+        assert_eq!(scanned.tasks.len(), 1);
+        let task = &scanned.tasks[0];
+        assert_eq!(task.id, task_id);
+        assert_eq!(task.title, "Drain the queue");
+        assert_eq!(task.scope, "src/queue/**");
+        assert_eq!(task.description, "One worker is enough.");
+        assert_eq!(task.sections.len(), 1);
+        assert_eq!(task.sections[0].title, "Measurement");
+        assert_eq!(task.sections[0].body, "Find the slow path.");
+        assert_eq!(task.sections[0].subtasks[0].title, "Time one flush");
+        assert_eq!(task.sections[0].subtasks[0].body, "Use the dev database.");
+        assert!(task.sections[0].subtasks[0].done);
+        assert_eq!(task.dods[0].title, "The queue drains under a second.");
+        assert!(task.dods[0].done);
     }
 
     #[test]

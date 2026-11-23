@@ -28,7 +28,8 @@ use ports::{
     Model, ModelTarget, NewAttempt, NewCheck, NewCheckResult, NewCheckRun, NewConcept,
     NewConceptReview, NewDecision, NewDrill, NewDrillRun, NewEvent, NewGate, NewHandoff, NewNote,
     NewPlanItem, NewPlanMessage, NewProject, NewQuestion, NewTask, NewTaskNote, NoModel, NoRunner,
-    PlanChatContext, PlanContext, ProjectFiles, RunRequest, RunStop, Runner, ScopedFile, Store,
+    PlanChatContext, PlanContext, ProjectFiles, RunRequest, RunStop, Runner, ScannedTask,
+    ScopedFile, Store,
 };
 use validation as check;
 
@@ -162,7 +163,10 @@ impl<S: Store> App<S> {
     }
 
     /// The import lane: external edits to the brief and notes are applied as
-    /// user events before the project is returned (I4/I5 untouched).
+    /// user events before the project is returned (I4/I5 untouched). A folder
+    /// copied from another installation reads the same way: its documents name
+    /// that installation's project, which this store has never seen, so they
+    /// are adopted and then re-projected under this project's id.
     fn import_external(&self, project: &ProjectDetail) -> Result<ProjectDetail, AppError> {
         let scanned = match self.files.scan(project) {
             Ok(scanned) => scanned,
@@ -174,7 +178,7 @@ impl<S: Store> App<S> {
         let mut current = project.clone();
 
         if let Some(brief) = scanned.brief {
-            if brief != current.brief {
+            if self.document_is_ours(&project.id, &brief.project) && brief.text != current.brief {
                 let at = self.now();
                 let event = self.event(
                     at,
@@ -185,11 +189,14 @@ impl<S: Store> App<S> {
                 );
                 current = self
                     .store
-                    .update_brief(&project.id, &brief, None, at, &event)?;
+                    .update_brief(&project.id, &brief.text, None, at, &event)?;
             }
         }
 
         for note in scanned.notes {
+            if !self.document_is_ours(&project.id, &note.project) {
+                continue;
+            }
             let existing = current.notes.iter().find(|entry| entry.id == note.id);
             match existing {
                 Some(entry) if entry.text == note.text && entry.title == note.title => {}
@@ -234,11 +241,220 @@ impl<S: Store> App<S> {
             }
         }
 
+        let mut created = false;
+        for task in scanned.tasks {
+            if !self.document_is_ours(&project.id, &task.project) {
+                continue;
+            }
+            match self.store.task(&task.id) {
+                // Already known: the document is this task's projection, so the
+                // store stays the source of truth.
+                Ok(existing) => {
+                    if existing.project_id != project.id {
+                        tracing::warn!(task = %task.id, "task document names another project's task");
+                    }
+                    continue;
+                }
+                Err(AppError::NotFound(_)) => {}
+                Err(error) => {
+                    tracing::warn!(task = %task.id, error = %error, "task lookup failed");
+                    continue;
+                }
+            }
+            match self.import_task(&project.id, &task) {
+                Ok(()) => created = true,
+                Err(error) => {
+                    tracing::warn!(task = %task.id, error = %error, "task import failed");
+                }
+            }
+        }
+        if created {
+            // `create_task` makes the task it inserts current. A document that
+            // arrived from disk must not move the batch the user is on.
+            if let Some(previous) = project.current_task_id.as_deref() {
+                let at = self.now();
+                let event = self.event(
+                    at,
+                    EventKind::TaskSwitched,
+                    "current task restored after import",
+                    Some(&project.id),
+                    Some(previous),
+                );
+                if let Err(error) = self.store.set_current_task(&project.id, previous, &event) {
+                    tracing::warn!(project_id = %project.id, error = %error, "current task restore failed");
+                }
+            }
+            current = self.store.project(&project.id)?;
+        }
+
         Ok(current)
     }
 
+    /// A task document carries its own id, so importing one is a create in the
+    /// plan phase: the tree in the file becomes the plan, and the app's
+    /// projection of phase, lane and history takes over from there.
+    fn import_task(&self, project_id: &str, scanned: &ScannedTask) -> Result<(), AppError> {
+        let title = check::title(&scanned.title)?;
+        let scope = check::optional(&scanned.scope, "scope", check::REASON_MAX)?;
+        let description = check::optional(&scanned.description, "prediction", check::ANSWER_MAX)?;
+        let at = self.now();
+        let task = NewTask {
+            id: scanned.id.clone(),
+            project_id: project_id.to_owned(),
+            title,
+            scope,
+            prediction: description,
+            at,
+        };
+        let event = self.event(
+            at,
+            EventKind::TaskPlanned,
+            "task imported from markdown".to_owned(),
+            Some(project_id),
+            Some(&scanned.id),
+        );
+        self.store.create_task(task, &event)?;
+
+        let mut items = Vec::new();
+        for (index, section) in scanned.sections.iter().enumerate() {
+            let Ok(title) = check::title(&section.title) else {
+                continue;
+            };
+            let Ok(body) = check::optional(&section.body, "plan detail", check::ANSWER_MAX) else {
+                continue;
+            };
+            let section_id = self.id();
+            items.push(NewPlanItem {
+                id: section_id.clone(),
+                parent_id: None,
+                kind: PlanItemKind::Section,
+                title,
+                body,
+                position: (index + 1) as i32,
+                status: PlanItemStatus::Open,
+                source: PlanSource::User,
+                check_id: None,
+                at,
+            });
+            for (order, subtask) in section.subtasks.iter().enumerate() {
+                let Ok(title) = check::title(&subtask.title) else {
+                    continue;
+                };
+                let Ok(body) = check::optional(&subtask.body, "plan detail", check::ANSWER_MAX)
+                else {
+                    continue;
+                };
+                items.push(NewPlanItem {
+                    id: self.id(),
+                    parent_id: Some(section_id.clone()),
+                    kind: PlanItemKind::Subtask,
+                    title,
+                    body,
+                    position: (order + 1) as i32,
+                    status: if subtask.done {
+                        PlanItemStatus::Done
+                    } else {
+                        PlanItemStatus::Open
+                    },
+                    source: PlanSource::User,
+                    check_id: None,
+                    at,
+                });
+            }
+        }
+        for (index, dod) in scanned.dods.iter().enumerate() {
+            let Ok(title) = check::title(&dod.title) else {
+                continue;
+            };
+            let Ok(body) = check::optional(&dod.body, "plan detail", check::ANSWER_MAX) else {
+                continue;
+            };
+            items.push(NewPlanItem {
+                id: self.id(),
+                parent_id: None,
+                kind: PlanItemKind::Dod,
+                title,
+                body,
+                position: (index + 1) as i32,
+                status: if dod.done {
+                    PlanItemStatus::Done
+                } else {
+                    PlanItemStatus::Open
+                },
+                source: PlanSource::User,
+                check_id: None,
+                at,
+            });
+        }
+        if !items.is_empty() {
+            let summary = format!("{} plan items imported", items.len());
+            let event = self.event(
+                at,
+                EventKind::PlanItemAdded,
+                summary,
+                Some(project_id),
+                Some(&scanned.id),
+            );
+            self.store.add_plan_items(&scanned.id, items, at, &event)?;
+        }
+        Ok(())
+    }
+
+    /// A document belongs here when its frontmatter names this project, or when
+    /// it names a project this store has never seen — the mark of a folder that
+    /// arrived from another machine. A document that names another local
+    /// project is that project's, even if it sits in this folder.
+    fn document_is_ours(&self, project_id: &str, owner: &str) -> bool {
+        if owner == project_id {
+            return true;
+        }
+        match self.store.project(owner) {
+            Ok(_) => false,
+            Err(AppError::NotFound(_)) => true,
+            Err(error) => {
+                tracing::warn!(project = owner, error = %error, "document ownership check failed");
+                false
+            }
+        }
+    }
+
+    /// Launch reconciles every project with its folder before the shell draws,
+    /// so documents that arrived on disk — a `git pull` of a repository with
+    /// `.antik` inside, or a folder copied from another machine — are read once
+    /// at startup rather than when the project is next opened.
     pub fn bootstrap(&self) -> Result<Bootstrap, AppError> {
-        self.store.bootstrap()
+        let boot = self.store.bootstrap()?;
+        let mut changed = false;
+        for summary in &boot.projects {
+            changed |= self.refresh_from_disk(&summary.id);
+        }
+        if changed {
+            return self.store.bootstrap();
+        }
+        Ok(boot)
+    }
+
+    /// Best-effort: a folder that cannot be read is logged and the launch goes
+    /// on, because a document error must not lock the user out of the app.
+    fn refresh_from_disk(&self, project_id: &str) -> bool {
+        let project = match self.store.project(project_id) {
+            Ok(project) => project,
+            Err(error) => {
+                tracing::warn!(project_id, error = %error, "startup import: project read failed");
+                return false;
+            }
+        };
+        match self.import_external(&project) {
+            Ok(imported) if imported.revision != project.revision => {
+                self.project_to_disk(&imported);
+                true
+            }
+            Ok(_) => false,
+            Err(error) => {
+                tracing::warn!(project_id, error = %error, "startup import failed");
+                false
+            }
+        }
     }
 
     pub fn create_project(&self, input: CreateProjectInput) -> Result<ProjectDetail, AppError> {
@@ -332,6 +548,16 @@ impl<S: Store> App<S> {
         let project = self
             .store
             .set_project_path(project_id, repo.as_deref(), at, &event)?;
+        // A directory that already carries antik documents is read before the
+        // projection writes over them: that is how a cloned repository's brief
+        // and notes arrive on a new machine.
+        let project = match self.import_external(&project) {
+            Ok(imported) => imported,
+            Err(error) => {
+                tracing::warn!(project_id, error = %error, "import after attaching a path failed");
+                project
+            }
+        };
         self.project_to_disk(&project);
         Ok(project)
     }

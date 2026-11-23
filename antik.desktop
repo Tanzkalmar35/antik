@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=antik
+GenericName=Coding Practice Harness
+Comment=A local-first learning harness for coding work
+Exec=antik %U
+Icon=antik
+Terminal=false
+Categories=Development;
+Keywords=learning;practice;notes;tasks;ai;
+StartupNotify=true
+StartupWMClass=antik
